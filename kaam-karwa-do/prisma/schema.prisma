@@ -1,0 +1,433 @@
+// KAAM KARWA DO — database schema
+// Phase 1: foundation, location, categories, settings.
+// Phase 2: customer auth (OTP + password), sessions, tasks
+// (customer-facing lifecycle), notifications.
+// Phase 3: worker auth, worker profile/skills/availability/location,
+// worker verification (status tracking only — no real KYC integrated),
+// and wiring workers into the Task lifecycle (accept/start/complete).
+// Payments, chat, reviews/ratings collection, and admin are still NOT
+// built yet.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  WORKER
+  ADMIN
+}
+
+enum Language {
+  EN
+  HINGLISH
+}
+
+enum LocationSource {
+  DEVICE_GPS
+  MANUAL
+}
+
+enum TaskStatus {
+  PENDING
+  ACCEPTED
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskPayoutStatus {
+  PENDING
+  PAID
+}
+
+enum WorkerVerificationStatus {
+  PENDING
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+enum OtpPurpose {
+  SIGNUP
+  LOGIN
+}
+
+enum NotificationType {
+  TASK_UPDATE
+  SYSTEM
+  ACCOUNT
+}
+
+model User {
+  id            String    @id @default(cuid())
+  phone         String?   @unique
+  email         String?   @unique
+  name          String?
+  role          Role      @default(CUSTOMER)
+  passwordHash  String?
+  avatarUrl     String?
+
+  // Consent + verification — required before a customer session is trusted.
+  phoneVerifiedAt   DateTime?
+  acceptedTermsAt   DateTime?
+  acceptedPrivacyAt DateTime?
+
+  language      Language  @default(EN)
+
+  customerProfile CustomerProfile?
+  workerProfile   WorkerProfile?
+  addresses       Address[]
+  settings        PlatformSetting?
+  tasks           Task[]
+  assignedTasks   Task[]    @relation("AssignedWorkerTasks")
+  notifications   Notification[]
+  otpCodes        OtpCode[]
+  sessions        Session[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([role])
+}
+
+// Server-side session record. The session cookie only carries an opaque
+// token; role/user are always re-checked against this table (never trust
+// the frontend / a decoded-but-unverified claim alone).
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  userAgent String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// One-time codes for signup/login verification.
+// In Phase 2, the only implemented provider is a DEV-ONLY provider (see
+// src/lib/auth/otpProvider.ts) — no real SMS is sent unless a real
+// provider's credentials are configured in a later phase.
+model OtpCode {
+  id          String     @id @default(cuid())
+  userId      String?
+  user        User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  phone       String
+  codeHash    String
+  purpose     OtpPurpose
+  attempts    Int        @default(0)
+  consumedAt  DateTime?
+  expiresAt   DateTime
+
+  createdAt   DateTime   @default(now())
+
+  @@index([phone, purpose])
+  @@index([expiresAt])
+}
+
+model CustomerProfile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bio       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Worker-facing profile. Public-safe fields (name/photo/categories/
+// skills/area/rating/completed-count/verification badge) are exposed via
+// /worker/profile and (in a later phase) a public directory. Private
+// fields — exact location, payout reference, verification internals —
+// are never exposed through any public-facing query.
+model WorkerProfile {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bio           String?
+  experienceYears Int?
+  languages     String[] @default([])
+
+  categories    Category[] @relation("WorkerCategories")
+  skills        WorkerSkill[]
+  availability  WorkerAvailability?
+  location      WorkerLocation?
+  verification  WorkerVerification?
+
+  // Set once the multi-step /worker/onboarding flow is fully submitted.
+  // Until then, the worker is redirected back into onboarding instead of
+  // the dashboard.
+  onboardingCompletedAt DateTime?
+
+  // Aggregate reputation. No review/rating-collection system exists yet
+  // (that's a later phase), so this stays null and the UI shows "No
+  // ratings yet" rather than a fabricated number. Completed-task counts
+  // and completion rate are computed live from the Task table instead of
+  // cached here, so they can never drift from real data.
+  rating        Float?
+
+  // Payout linkage — set via the DEV ONLY payout provider architecture
+  // (src/lib/worker/payoutProvider.ts). Only ever an opaque provider
+  // reference and a masked label; the raw account number entered during
+  // onboarding is never persisted anywhere.
+  payoutProvider    String?
+  payoutAccountRef  String?
+  payoutMaskedLabel String?
+  payoutLinkedAt    DateTime?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([onboardingCompletedAt])
+}
+
+// Free-text skill tags per worker (distinct from Category, which is the
+// structured task-category taxonomy workers opt into).
+model WorkerSkill {
+  id              String        @id @default(cuid())
+  workerProfileId String
+  workerProfile   WorkerProfile @relation(fields: [workerProfileId], references: [id], onDelete: Cascade)
+
+  name            String
+
+  createdAt       DateTime      @default(now())
+
+  @@index([workerProfileId])
+  @@index([name])
+}
+
+model WorkerAvailability {
+  id              String        @id @default(cuid())
+  workerProfileId String        @unique
+  workerProfile   WorkerProfile @relation(fields: [workerProfileId], references: [id], onDelete: Cascade)
+
+  isAvailable     Boolean       @default(false)
+  // e.g. ["MON","TUE","WED"]
+  workingDays     String[]      @default([])
+  startTime       String?       // "09:00" — simple HH:mm, no timezone math needed for Phase 3
+  endTime         String?       // "18:00"
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+// Worker's own location + service radius. Deliberately separate from the
+// customer-facing Address model. Exact coordinates here are PRIVATE —
+// only ever used server-side to compute city/area-level matching, never
+// returned from any endpoint a customer or another worker can read.
+model WorkerLocation {
+  id              String         @id @default(cuid())
+  workerProfileId String         @unique
+  workerProfile   WorkerProfile  @relation(fields: [workerProfileId], references: [id], onDelete: Cascade)
+
+  cityId          String?
+  city            City?          @relation(fields: [cityId], references: [id])
+  areaId          String?
+  area            Area?          @relation(fields: [areaId], references: [id])
+
+  // Private — never exposed publicly. See privacy rule from Phase 1.
+  latitude        Float?
+  longitude       Float?
+
+  radiusKm        Int            @default(5)
+  source          LocationSource @default(MANUAL)
+
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([cityId])
+  @@index([areaId])
+}
+
+// Verification status tracking only. Deliberately does NOT store any
+// government ID number, document image, or other raw KYC data — no real
+// verification provider is integrated in this phase. See
+// src/lib/worker/verificationProvider.ts for the placeholder
+// architecture a real KYC provider would plug into.
+model WorkerVerification {
+  id              String                    @id @default(cuid())
+  workerProfileId String                    @unique
+  workerProfile   WorkerProfile             @relation(fields: [workerProfileId], references: [id], onDelete: Cascade)
+
+  status          WorkerVerificationStatus  @default(PENDING)
+  provider        String?                   // null until a real KYC provider is configured
+  submittedAt     DateTime?
+  reviewedAt      DateTime?
+  rejectionReason String?
+
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  @@index([status])
+}
+
+model Category {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  nameEn      String
+  nameHinglish String
+  icon        String?
+  isActive    Boolean  @default(true)
+
+  workers     WorkerProfile[] @relation("WorkerCategories")
+  tasks       Task[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+model City {
+  id        String   @id @default(cuid())
+  name      String
+  state     String
+  country   String   @default("India")
+
+  areas     Area[]
+  workerLocations WorkerLocation[]
+  addresses Address[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([name, state])
+  @@index([state])
+}
+
+model Area {
+  id        String   @id @default(cuid())
+  name      String
+  cityId    String
+  city      City     @relation(fields: [cityId], references: [id], onDelete: Cascade)
+
+  addresses Address[]
+  workerLocations WorkerLocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cityId])
+}
+
+model Address {
+  id            String          @id @default(cuid())
+  userId        String
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  label         String?         // e.g. "Home", "Shop"
+  formatted     String          // human-readable address returned by geocoding
+  pincode       String?
+
+  cityId        String?
+  city          City?           @relation(fields: [cityId], references: [id])
+  areaId        String?
+  area          Area?           @relation(fields: [areaId], references: [id])
+
+  // Exact coordinates. Access to this field must be restricted at the
+  // application layer — never exposed publicly, only to an assigned worker
+  // at the appropriate point in the task lifecycle (enforced in Phase 2+).
+  latitude      Float?
+  longitude     Float?
+
+  source        LocationSource  @default(MANUAL)
+  isDefault     Boolean         @default(false)
+
+  tasks         Task[]
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([userId])
+  @@index([cityId])
+  @@index([areaId])
+}
+
+// Customer-facing task record, extended in Phase 3 to support the worker
+// lifecycle: PENDING (open, unassigned) → ACCEPTED (a worker took it) →
+// ACTIVE (worker started) → COMPLETED. CANCELLED remains customer-only.
+model Task {
+  id            String     @id @default(cuid())
+  customerId    String
+  customer      User       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  categoryId    String?
+  category      Category?  @relation(fields: [categoryId], references: [id])
+
+  title         String
+  description   String?
+  status        TaskStatus @default(PENDING)
+
+  addressId     String?
+  address       Address?   @relation(fields: [addressId], references: [id])
+
+  scheduledFor  DateTime?
+  budget        Int?       // in INR, whole rupees — kept simple for Phase 2/3
+
+  // Worker assignment. Null while PENDING (open pool). A worker's
+  // dashboard queries are always additionally scoped by assignedWorkerId
+  // = their own user id — never by anything the client asserts.
+  assignedWorkerId String?
+  assignedWorker   User?    @relation("AssignedWorkerTasks", fields: [assignedWorkerId], references: [id])
+  acceptedAt       DateTime?
+  startedAt        DateTime?
+  completedAt      DateTime?
+
+  // No real payments/payout gateway is integrated yet — this only tracks
+  // intent. It never transitions to PAID anywhere in this phase; that
+  // requires a real payout provider (see src/lib/worker/payoutProvider.ts).
+  payoutStatus     TaskPayoutStatus @default(PENDING)
+
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@index([customerId])
+  @@index([status])
+  @@index([categoryId])
+  @@index([assignedWorkerId])
+  @@index([assignedWorkerId, status])
+}
+
+model Notification {
+  id        String            @id @default(cuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type      NotificationType  @default(SYSTEM)
+  title     String
+  body      String?
+  isRead    Boolean           @default(false)
+
+  createdAt DateTime          @default(now())
+
+  @@index([userId])
+  @@index([userId, isRead])
+}
+
+model PlatformSetting {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  language              Language @default(EN)
+  locationPreference    LocationSource @default(MANUAL)
+  notificationsEnabled  Boolean  @default(true)
+  smsNotifications      Boolean  @default(true)
+  emailNotifications    Boolean  @default(false)
+
+  createdAt             DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+}
