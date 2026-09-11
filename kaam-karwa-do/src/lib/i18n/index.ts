@@ -35,7 +35,7 @@ export function getDictionary(lang: Language): Dictionary {
 // Simple dot-path translator, e.g. t(dict, "location.title")
 export function translate(dict: Dictionary, path: string): string {
   const parts = path.split(".");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
   let current: any = dict;
   for (const part of parts) {
     if (current && typeof current === "object" && part in current) {
